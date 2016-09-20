@@ -1,39 +1,92 @@
 #!/bin/bash
-set -e
+set -eu
 
+declare -A aliases=(
+	[1.12]='1 latest'
+	[1.13-rc]='rc'
+)
+
+self="$(basename "$BASH_SOURCE")"
 cd "$(dirname "$(readlink -f "$BASH_SOURCE")")"
 
-url='git://github.com/docker-library/docker'
+versions=( */ )
+versions=( "${versions[@]%/}" )
 
-echo '# maintainer: InfoSiftr <github@infosiftr.com> (@infosiftr)'
+# sort version numbers with highest first
+IFS=$'\n'; versions=( $(echo "${versions[*]}" | sort -rV) ); unset IFS
 
-commit="$(git log -1 --format='format:%H' -- .)"
-fullVersion="$(grep -m1 'ENV DOCKER_VERSION ' Dockerfile | cut -d' ' -f3)"
+# get the most recent commit which modified any of "$@"
+fileCommit() {
+	git log -1 --format='format:%H' HEAD -- "$@"
+}
 
-versionAliases=()
-while [ "${fullVersion%[.-]*}" != "$fullVersion" ]; do
-	versionAliases+=( $fullVersion )
-	fullVersion="${fullVersion%[.-]*}"
-done
-versionAliases+=( $fullVersion latest )
+# get the most recent commit which modified "$1/Dockerfile" or any file COPY'd from "$1/Dockerfile"
+dirCommit() {
+	local dir="$1"; shift
+	(
+		cd "$dir"
+		fileCommit \
+			Dockerfile \
+			$(git show HEAD:./Dockerfile | awk '
+				toupper($1) == "COPY" {
+					for (i = 2; i < NF; i++) {
+						print $i
+					}
+				}
+			')
+	)
+}
 
-echo
-for va in "${versionAliases[@]}"; do
-	echo "$va: ${url}@${commit}"
-done
+cat <<-EOH
+# this file is generated via https://github.com/docker-library/docker/blob/$(fileCommit "$self")/$self
 
-for variant in dind git; do
-	commit="$(git log -1 --format='format:%H' -- "$variant")"
+Maintainers: Tianon Gravi <tianon@dockerproject.org> (@tianon),
+             Joseph Ferguson <yosifkit@gmail.com> (@yosifkit)
+GitRepo: https://github.com/docker-library/docker.git
+EOH
+
+# prints "$2$1$3$1...$N"
+join() {
+	local sep="$1"; shift
+	local out; printf -v out "${sep//%/%%}%s" "$@"
+	echo "${out#$sep}"
+}
+
+for version in "${versions[@]}"; do
+	commit="$(dirCommit "$version")"
+
+	fullVersion="$(git show "$commit":"$version/Dockerfile" | awk '$1 == "ENV" && $2 == "DOCKER_VERSION" { print $3; exit }')"
+
+	versionAliases=(
+		$fullVersion
+		$version
+		${aliases[$version]:-}
+	)
+
 	echo
-	for va in "${versionAliases[@]}"; do
-		if [ "$va" = 'latest' ]; then
-			va="$variant"
-		else
-			va="$va-$variant"
-		fi
-		echo "$va: ${url}@${commit} $variant"
+	cat <<-EOE
+		Tags: $(join ', ' "${versionAliases[@]}")
+		GitCommit: $commit
+		Directory: $version
+	EOE
+
+	for variant in \
+		dind git \
+		experimental experimental/dind experimental/git \
+	; do
+		[ -f "$version/$variant/Dockerfile" ] || continue
+
+		commit="$(dirCommit "$version/$variant")"
+
+		slash='/'
+		variantAliases=( "${versionAliases[@]/%/-${variant//$slash/-}}" )
+		variantAliases=( "${variantAliases[@]//latest-/}" )
+
+		echo
+		cat <<-EOE
+			Tags: $(join ', ' "${variantAliases[@]}")
+			GitCommit: $commit
+			Directory: $version/$variant
+		EOE
 	done
 done
-
-echo
-echo '# "supported": one tag per major, only upstream-supported majors (which is currently only "latest")'
